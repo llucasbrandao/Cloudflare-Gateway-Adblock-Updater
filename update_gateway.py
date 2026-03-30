@@ -58,10 +58,22 @@ session.headers.update(headers)
 # 10000+: Hagezi filters (ordered by importance)
 blocklists: List[Dict[str, str]] = [
     {
-        "name": "Hagezi Pro++",
+        "name": "Hagezi Pro++ - Only Domains",
         "url": "https://gitlab.com/hagezi/mirror/-/raw/main/dns-blocklists/wildcard/pro.plus-onlydomains.txt",
         "backup_url": "https://cdn.jsdelivr.net/gh/hagezi/dns-blocklists@latest/wildcard/pro.plus-onlydomains.txt",
         "priority": 10000
+    },
+    {
+        "name": "Hagezi TIF - Only Domains",
+        "url": "https://gitlab.com/hagezi/mirror/-/raw/main/dns-blocklists/wildcard/tif-onlydomains.txt",
+        "backup_url": "https://cdn.jsdelivr.net/gh/hagezi/dns-blocklists@latest/wildcard/tif-onlydomains.txt",
+        "priority": 10001
+    },
+    {
+        "name": "Hagezi Social Networks - Only Domains",
+        "url": "https://gitlab.com/hagezi/mirror/-/raw/main/dns-blocklists/wildcard/social-onlydomains.txt",
+        "backup_url": "https://cdn.jsdelivr.net/gh/hagezi/dns-blocklists@latest/wildcard/social-onlydomains.txt",
+        "priority": 10002
     }
 ]
 
