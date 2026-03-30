@@ -1,17 +1,24 @@
-# Cloudflare Gateway Global Adblock Updater
+# Cloudflare Gateway Adblock Updater
+# Author: SeriousHoax
+# GitHub: https://github.com/SeriousHoax
+# License: MIT
+
 import requests
 import aiohttp
 import asyncio
+import json
 import os
 import sys
 import time
 import logging
 import re
 from typing import Dict, List, Optional
+from datetime import datetime
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
 logger = logging.getLogger(__name__)
 
+# Get env vars from GitHub secrets
 api_token = os.environ.get('CLOUDFLARE_API_TOKEN')
 account_id = os.environ.get('CLOUDFLARE_ACCOUNT_ID')
 
@@ -19,15 +26,24 @@ if not api_token or not account_id:
     logger.error("🚫 Missing API token or account ID.")
     sys.exit(1)
 
+# Configuration
 REQUEST_TIMEOUT = int(os.environ.get('REQUEST_TIMEOUT', '30'))
 MAX_RETRIES = 3
 BACKOFF_FACTOR = 5
 CHUNK_SIZE = 1000
-API_DELAY = 0.1
-MAX_CONCURRENT_REQUESTS = int(os.environ.get('MAX_CONCURRENT_REQUESTS', '25'))
-Fresh_Start = os.environ.get('FRESH_START', 'false').lower() == 'true'
+MAX_LISTS_WARNING = 900
+API_DELAY = 0.1   # Small delay between requests to avoid rate limiting
 
+# Async configuration
+MAX_CONCURRENT_REQUESTS = int(os.environ.get('MAX_CONCURRENT_REQUESTS', '25'))
+
+# Version tracking configuration
+Fresh_Start = os.environ.get('FRESH_START', 'false').lower() == 'true'
+CHECK_VERSIONS = os.environ.get('CHECK_VERSIONS', 'true').lower() == 'true'
+
+# API base URL
 base_url = f"https://api.cloudflare.com/client/v4/accounts/{account_id}/gateway"
+
 headers = {
     "Authorization": f"Bearer {api_token}",
     "Content-Type": "application/json"
@@ -36,244 +52,903 @@ headers = {
 session = requests.Session()
 session.headers.update(headers)
 
-# Add or remove lists here
-blocklists = [
-    "https://gitlab.com/hagezi/mirror/-/raw/main/dns-blocklists/wildcard/pro.plus-onlydomains.txt",
-    "https://gitlab.com/hagezi/mirror/-/raw/main/dns-blocklists/wildcard/tif-onlydomains.txt"
+# Blocklists configuration with explicit priorities
+# Priority order (lower number = higher priority):
+# 1-9999: Reserved for custom policies (Allow Rules, Content Blocking, etc.)
+# 10000+: Hagezi filters (ordered by importance)
+blocklists: List[Dict[str, str]] = [
+    {
+        "name": "Hagezi Pro++ - Only Domains",
+        "url": "https://gitlab.com/hagezi/mirror/-/raw/main/dns-blocklists/wildcard/pro.plus-onlydomains.txt",
+        "backup_url": "https://cdn.jsdelivr.net/gh/hagezi/dns-blocklists@latest/wildcard/pro.plus-onlydomains.txt",
+        "priority": 10000
+    },
+    {
+        "name": "Hagezi TIF - Only Domains",
+        "url": "https://gitlab.com/hagezi/mirror/-/raw/main/dns-blocklists/wildcard/tif-onlydomains.txt",
+        "backup_url": "https://cdn.jsdelivr.net/gh/hagezi/dns-blocklists@latest/wildcard/tif-onlydomains.txt",
+        "priority": 10001
+    },
+    {
+        "name": "Hagezi Social Networks - Only Domains",
+        "url": "https://gitlab.com/hagezi/mirror/-/raw/main/dns-blocklists/wildcard/social-onlydomains.txt",
+        "backup_url": "https://cdn.jsdelivr.net/gh/hagezi/dns-blocklists@latest/wildcard/social-onlydomains.txt",
+        "priority": 10002
+    }
 ]
 
+# Version tracking functions
+def extract_version_from_description(description: str) -> Optional[str]:
+    """
+    Extract version from policy description.
+    Returns: version string or None if not found
+    """
+    if not description:
+        return None
+    
+    # Pattern to match ", Version: X.X.X" at the end of description
+    match = re.search(r',\s*Version:\s*([^\s,]+)', description)
+    if match:
+        return match.group(1).strip()
+    return None
+
+def load_versions_from_policies(cached_rules: List[Dict]) -> Dict[str, str]:
+    """
+    Load versions from all policies by extracting from their descriptions.
+    Returns: dict mapping filter_name -> version
+    """
+    versions = {}
+    
+    for rule in cached_rules:
+        rule_name = rule.get('name', '')
+        # Check if this is a Hagezi policy (starts with "Hagezi")
+        if rule_name.startswith('Hagezi'):
+            filter_name = rule_name
+            description = rule.get('description', '')
+            version = extract_version_from_description(description)
+            
+            if version:
+                versions[filter_name] = version
+                logger.debug(f"💾 Loaded version for {filter_name}: {version}")
+    
+    return versions
+
+def build_description_with_version(filter_name: str, list_count: int, 
+                                   domain_count: int, version: Optional[str]) -> str:
+    """
+    Build policy description with version info.
+    Format: "Block domains from {filter_name} ({list_count} lists, {domain_count} domains), Version: {version}"
+    """
+    base_description = f"Block domains from {filter_name} ({list_count} lists, {domain_count} domains)"
+    
+    if version:
+        return f"{base_description}, Version: {version}"
+    
+    return base_description
+
+def fetch_blocklist_version(url: str, backup_url: Optional[str], filter_name: str) -> Optional[str]:
+    """Fetch blocklist header to extract version using streaming."""
+    for fetch_url in [url, backup_url]:
+        if fetch_url is None:
+            continue
+        try:
+            # Use iter_lines to handle gzip/encoding correctly and avoid downloading full file
+            with requests.get(fetch_url, timeout=REQUEST_TIMEOUT, stream=True) as response:
+                if response.status_code == 200:
+                    # Scan first 15 lines for version info (most headers are at the top)
+                    for i, line in enumerate(response.iter_lines(decode_unicode=True)):
+                        if i > 15:
+                            break
+                        if not line:
+                            continue
+                        
+                        line = line.strip()
+                        if line.startswith('# Version:'):
+                            version = line.replace('# Version:', '').strip()
+                            logger.info(f"  ℹ️ Found version for {filter_name}: {version}")
+                            return version
+        except Exception as e:
+            logger.warning(f"  ⚠️ Error fetching version from {fetch_url}: {e}")
+            continue
+    
+    logger.warning(f"  ⚠️ No version info found for {filter_name}")
+    return None
+
+def should_update_filter(filter_config: Dict, cached_rules: List[Dict]) -> tuple:
+    """
+    Check if a filter needs updating based on version comparison AND policy existence.
+    Returns: (should_update: bool, current_version: str, reason: str)
+    """
+    filter_name = filter_config['name']
+    policy_name = filter_name
+    
+    # Fresh start if flag set
+    if Fresh_Start:
+        return True, None, "Fresh_Start enabled"
+    
+    # Skip version check if disabled
+    if not CHECK_VERSIONS:
+        return True, None, "Version checking disabled"
+    
+    # Fetch current version from blocklist
+    current_version = fetch_blocklist_version(
+        filter_config['url'],
+        filter_config.get('backup_url'),
+        filter_name
+    )
+    
+    if not current_version:
+        logger.warning(f"  ⚠️ Could not determine version, will update to be safe")
+        return True, None, "Version unknown"
+    
+    # Find the policy in Cloudflare
+    policy = next((rule for rule in cached_rules if rule['name'] == policy_name), None)
+    
+    if not policy:
+        logger.info(f"  ❓ No existing policy found, first run for {filter_name}")
+        return True, current_version, "First run (no policy)"
+    
+    # Extract version from policy description
+    policy_description = policy.get('description', '')
+    cached_version = extract_version_from_description(policy_description)
+    
+    if not cached_version:
+        logger.warning(f"  ⚠️ Policy exists but no version info in description, treating as first run")
+        return True, current_version, "No version in description (migrating)"
+    
+    if current_version != cached_version:
+        logger.info(f"  🔔 Version changed: {cached_version} → {current_version}")
+        return True, current_version, "Version changed"
+    
+    # Check if precedence matches
+    target_precedence = filter_config.get('priority')
+    current_precedence = policy.get('precedence')
+    
+    if target_precedence is not None and current_precedence != target_precedence:
+        logger.info(f"  ⚠️ Precedence mismatch: {current_precedence} (current) ≠ {target_precedence} (target)")
+        return True, current_version, f"Precedence mismatch ({current_precedence} -> {target_precedence})"
+    
+    logger.info(f"  ⏭️ Version unchanged ({current_version}), skipping update")
+    return False, current_version, "Version unchanged"
+
+# Sync API functions (for non-critical operations)
+def api_request(method: str, url: str, data: Optional[Dict] = None, 
+                retries: int = MAX_RETRIES, backoff_factor: int = BACKOFF_FACTOR, 
+                timeout: int = REQUEST_TIMEOUT) -> requests.Response:
+    """Make API request with retry logic (sync version)."""
+    last_exception = None
+    for attempt in range(1, retries + 1):
+        try:
+            kwargs = {"timeout": timeout}
+            if data:
+                kwargs["json"] = data
+            response = getattr(session, method.lower())(url, **kwargs)
+            
+            if response.status_code == 429:
+                retry_after = int(response.headers.get('Retry-After', backoff_factor * (2 ** (attempt - 1))))
+                logger.warning(f"⚠️ Rate limited (429). Waiting {retry_after}s before retry {attempt}/{retries}...")
+                time.sleep(retry_after)
+                continue
+            
+            if response.status_code >= 500 and attempt < retries:
+                sleep_time = backoff_factor * (2 ** (attempt - 1))
+                logger.warning(f"⚠️ Server error {response.status_code}. Retry {attempt}/{retries} in {sleep_time}s...")
+                time.sleep(sleep_time)
+                continue
+            
+            return response
+        except requests.exceptions.RequestException as e:
+            last_exception = e
+            if attempt < retries:
+                sleep_time = backoff_factor * (2 ** (attempt - 1))
+                logger.warning(f"⚠️ Request exception: {e}. Retry {attempt}/{retries} in {sleep_time}s...")
+                time.sleep(sleep_time)
+            else:
+                logger.error(f"🚫 All retries exhausted for {method} {url}")
+                raise last_exception
+    
+    if last_exception:
+        raise last_exception
+    raise Exception(f"Unexpected error in api_request for {method} {url}")
+
+def check_api_response(response: requests.Response, action: str) -> Dict:
+    """Validate API response and return JSON data."""
+    if response.status_code != 200:
+        logger.error(f"🚫 Error {action}: {response.status_code} - {response.text}")
+        raise Exception(f"API error during {action}: {response.status_code}")
+    
+    data = response.json()
+    if not data.get('success', False):
+        logger.error(f"🚫 API success false during {action}: {json.dumps(data)}")
+        raise Exception(f"API returned success=false during {action}")
+    
+    return data
+
 def is_valid_domain(domain: str) -> bool:
-    if not domain or len(domain) > 253: return False
-    return bool(re.match(r'(?i)^([a-z0-9]+(-+[a-z0-9]+)*\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$', domain.lower()))
+    """Validate domain format."""
+    if not domain or len(domain) > 253:
+        return False
+    pattern = r'(?i)^([a-z0-9]+(-+[a-z0-9]+)*\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$'
+    return bool(re.match(pattern, domain.lower()))
 
 def chunker(seq: List[str], size: int):
-    for i in range(0, len(seq), size): yield seq[i:i + size]
+    """Split a sequence into chunks of specified size."""
+    for i in range(0, len(seq), size):
+        yield seq[i:i + size]
 
-def api_request(method: str, url: str, data: Optional[Dict] = None) -> requests.Response:
-    for attempt in range(1, MAX_RETRIES + 1):
-        try:
-            kwargs = {"timeout": REQUEST_TIMEOUT}
-            if data: kwargs["json"] = data
-            response = getattr(session, method.lower())(url, **kwargs)
-            if response.status_code == 429:
-                time.sleep(int(response.headers.get('Retry-After', BACKOFF_FACTOR)))
-                continue
-            if response.status_code >= 500 and attempt < MAX_RETRIES:
-                time.sleep(BACKOFF_FACTOR)
-                continue
-            return response
-        except Exception as e:
-            if attempt == MAX_RETRIES: raise e
-            time.sleep(BACKOFF_FACTOR)
+def get_all_paginated(endpoint: str, per_page: int = 100) -> List[Dict]:
+    """Fetch all items from a paginated endpoint."""
+    all_items = []
+    page = 1
+    
+    try:
+        while True:
+            url = f"{endpoint}?per_page={per_page}&page={page}"
+            response = api_request('GET', url)
+            data = check_api_response(response, f"getting {endpoint} page {page}")
+            
+            items = data.get('result') or []
+            all_items.extend(items)
+            
+            result_info = data.get('result_info') or {}
+            total_count = result_info.get('total_count', 0)
+            
+            if page * result_info.get('per_page', per_page) >= total_count or not items:
+                break
+            
+            page += 1
+            time.sleep(API_DELAY)
+        
+        safe_endpoint = endpoint.replace(account_id, '[HIDDEN]')
+        logger.info(f"☄️ Fetched {len(all_items)} items from {safe_endpoint} ({page} page(s))")
+        return all_items
+    except Exception as e:
+        logger.error(f"🚫 Pagination failed for {endpoint} at page {page}: {e}", exc_info=True)
+        raise
 
-def get_all_paginated(endpoint: str) -> List[Dict]:
-    all_items, page, per_page = [], 1, 100
-    while True:
-        resp = api_request('GET', f"{endpoint}?per_page={per_page}&page={page}").json()
-        items = resp.get('result') or []
-        all_items.extend(items)
-        if page * per_page >= resp.get('result_info', {}).get('total_count', 0) or not items: break
-        page += 1
-        time.sleep(API_DELAY)
-    return all_items
-
-async def async_api_request(session: aiohttp.ClientSession, method: str, url: str, data: Optional[Dict] = None) -> Dict:
+# Async API functions
+async def async_api_request(session: aiohttp.ClientSession, method: str, url: str, 
+                           data: Optional[Dict] = None) -> Dict:
+    """Make async API request with retry logic."""
     for attempt in range(1, MAX_RETRIES + 1):
         try:
             kwargs = {"timeout": aiohttp.ClientTimeout(total=REQUEST_TIMEOUT)}
-            if data: kwargs["json"] = data
+            if data:
+                kwargs["json"] = data
+            
             async with getattr(session, method.lower())(url, **kwargs) as response:
                 if response.status == 429:
-                    await asyncio.sleep(int(response.headers.get('Retry-After', BACKOFF_FACTOR)))
+                    retry_after = int(response.headers.get('Retry-After', BACKOFF_FACTOR * (2 ** (attempt - 1))))
+                    logger.warning(f"⚠️ Rate limited (429). Waiting {retry_after}s...")
+                    await asyncio.sleep(retry_after)
                     continue
+                
                 if response.status >= 500 and attempt < MAX_RETRIES:
-                    await asyncio.sleep(BACKOFF_FACTOR)
+                    sleep_time = BACKOFF_FACTOR * (2 ** (attempt - 1))
+                    logger.warning(f"⚠️ Server error {response.status}. Retry {attempt}/{MAX_RETRIES}...")
+                    await asyncio.sleep(sleep_time)
                     continue
-                if response.status == 400 and method.upper() in ('PATCH', 'POST', 'PUT'):
-                    result = await response.json()
-                    if any('not found in list' in e.get('message', '') for e in result.get('errors', [])):
-                        return {'status': response.status, 'data': result}
-                return {'status': response.status, 'data': await response.json()}
+                
+                # Retry on 400 for mutating requests (PATCH/POST/PUT) — can be transient conflicts
+                # But skip retry if the error is semantic (e.g. "not found in list") — retrying won't help
+                if response.status == 400 and method.upper() in ('PATCH', 'POST', 'PUT') and attempt < MAX_RETRIES:
+                    result_body = await response.json()
+                    errors = result_body.get('errors', [])
+                    if any('not found in list' in e.get('message', '') for e in errors):
+                        return {'status': response.status, 'data': result_body}
+                    sleep_time = BACKOFF_FACTOR * (2 ** (attempt - 1))
+                    logger.warning(f"⚠️ Bad request (400) on {method}. Retry {attempt}/{MAX_RETRIES} in {sleep_time}s...")
+                    await asyncio.sleep(sleep_time)
+                    continue
+                
+                result = await response.json()
+                return {'status': response.status, 'data': result}
+                
         except Exception as e:
-            if attempt == MAX_RETRIES: raise e
-            await asyncio.sleep(BACKOFF_FACTOR)
+            if attempt < MAX_RETRIES:
+                sleep_time = BACKOFF_FACTOR * (2 ** (attempt - 1))
+                await asyncio.sleep(sleep_time)
+            else:
+                raise Exception(f"All retries exhausted for {method} {url}: {e}")
+    
+    raise Exception(f"Unexpected error in async_api_request for {method} {url}")
 
-async def async_delete_lists_batch(lists: List[Dict]):
-    sem = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
-    async with aiohttp.ClientSession(headers=headers) as s:
-        async def delete(lst):
-            async with sem:
-                res = await async_api_request(s, 'DELETE', f"{base_url}/lists/{lst['id']}")
-                if res['status'] == 200: logger.info(f"🧹 Deleted: {lst['name']}")
+async def async_delete_list(session: aiohttp.ClientSession, semaphore: asyncio.Semaphore,
+                            list_id: str, list_name: str) -> bool:
+    """Delete a single list asynchronously."""
+    async with semaphore:
+        try:
+            url = f"{base_url}/lists/{list_id}"
+            result = await async_api_request(session, 'DELETE', url)
+            
+            if result['status'] == 200:
+                logger.info(f"  🧹 Deleted list: {list_name}")
                 await asyncio.sleep(API_DELAY)
-        await asyncio.gather(*(delete(l) for l in lists))
+                return True
+            else:
+                logger.warning(f"  ⚠️ Failed to delete {list_name}: {result['status']}")
+                return False
+        except Exception as e:
+            logger.warning(f"  ⚠️ Error deleting {list_name}: {e}")
+            return False
 
-async def async_create_list(session, sem, name, desc, items):
-    async with sem:
-        data = {"name": name, "type": "DOMAIN", "description": desc, "items": [{"value": d} for d in items]}
-        res = await async_api_request(session, 'POST', f"{base_url}/lists", data)
-        await asyncio.sleep(API_DELAY)
-        if res['status'] == 200 and res['data'].get('success'):
-            logger.info(f"🛠️ Created: {name}")
-            return res['data']['result']['id']
-        return None
+async def async_create_list(session: aiohttp.ClientSession, semaphore: asyncio.Semaphore,
+                           list_name: str, filter_name: str, chunk_num: int, 
+                           total_chunks: int, domains: List[str]) -> Optional[str]:
+    """Create a single list asynchronously."""
+    async with semaphore:
+        try:
+            data_payload = {
+                "name": list_name,
+                "type": "DOMAIN",
+                "description": f"{filter_name} Chunk {chunk_num}/{total_chunks}",
+                "items": [{"value": domain} for domain in domains]
+            }
+            
+            url = f"{base_url}/lists"
+            result = await async_api_request(session, 'POST', url, data_payload)
+            
+            if result['status'] == 200 and result['data'].get('success'):
+                list_id = result['data']['result']['id']
+                logger.info(f"  🛠️ Created list {chunk_num}/{total_chunks}: {list_name}")
+                await asyncio.sleep(API_DELAY)
+                return list_id
+            else:
+                logger.error(f"🚫 Failed to create {list_name}: {result}")
+                return None
+        except Exception as e:
+            logger.error(f"🚫 Error creating {list_name}: {e}")
+            return None
 
-async def async_get_list_items(session, list_id):
-    all_items, page = [], 1
+async def async_delete_lists_batch(lists_to_delete: List[Dict]) -> int:
+    """Delete multiple lists in parallel."""
+    if not lists_to_delete:
+        return 0
+    
+    semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
+    
+    async with aiohttp.ClientSession(headers=headers) as session:
+        tasks = [
+            async_delete_list(session, semaphore, lst['id'], lst['name'])
+            for lst in lists_to_delete
+        ]
+        results = await asyncio.gather(*tasks)
+    
+    return sum(1 for r in results if r)
+
+async def async_create_lists_batch(chunks: List[List[str]], filter_name: str, 
+                                  list_prefix: str) -> List[str]:
+    """Create multiple lists in parallel."""
+    if not chunks:
+        return []
+    
+    semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
+    
+    async with aiohttp.ClientSession(headers=headers) as session:
+        tasks = [
+            async_create_list(session, semaphore, f"{list_prefix}{i}", 
+                            filter_name, i, len(chunks), chunk)
+            for i, chunk in enumerate(chunks, 1)
+        ]
+        results = await asyncio.gather(*tasks)
+    
+    return [list_id for list_id in results if list_id is not None]
+
+async def async_get_list_items(session: aiohttp.ClientSession, list_id: str) -> List[str]:
+    """Fetch all items from a list."""
+    all_items = []
+    page = 1
+    per_page = 1000  # Max per page for this endpoint can be higher
+    
     while True:
-        res = await async_api_request(session, 'GET', f"{base_url}/lists/{list_id}/items?per_page=1000&page={page}")
-        if res['status'] != 200: break
-        items = res['data'].get('result') or []
-        all_items.extend(i['value'] for i in items)
-        if page * 1000 >= res['data'].get('result_info', {}).get('total_count', 0) or not items: break
+        url = f"{base_url}/lists/{list_id}/items?per_page={per_page}&page={page}"
+        result = await async_api_request(session, 'GET', url)
+        
+        if result['status'] != 200:
+            logger.warning(f"⚠️ Failed to get items for list {list_id}: {result['status']}")
+            break
+            
+        data = result['data']
+        items = data.get('result') or []
+        all_items.extend(item['value'] for item in items)
+        
+        result_info = data.get('result_info') or {}
+        total_count = result_info.get('total_count', 0)
+        
+        if page * per_page >= total_count or not items:
+            break
+            
         page += 1
         await asyncio.sleep(API_DELAY)
+        
     return all_items
 
-async def async_patch_list(session, sem, list_id, name, remove, append):
-    if not remove and not append: return True
-    async with sem:
-        payload = {}
-        if remove: payload['remove'] = remove
-        if append: payload['append'] = [{'value': d} for d in append]
-        res = await async_api_request(session, 'PATCH', f"{base_url}/lists/{list_id}", payload)
-        await asyncio.sleep(API_DELAY)
-        if res['status'] == 200:
-            logger.info(f"♻️ Patched {name}: -{len(remove)} / +{len(append)}")
+async def async_patch_list(session: aiohttp.ClientSession, semaphore: asyncio.Semaphore,
+                          list_id: str, list_name: str, remove: List[str], append: List[str]) -> bool:
+    """Patch a list by removing and/or appending items."""
+    if not remove and not append:
+        return True
+        
+    async with semaphore:
+        try:
+            payload = {}
+            if remove:
+                payload['remove'] = remove
+            if append:
+                payload['append'] = [{'value': domain} for domain in append]
+                
+            url = f"{base_url}/lists/{list_id}"
+            result = await async_api_request(session, 'PATCH', url, payload)
+            
+            if result['status'] == 200:
+                logger.info(f"  ♻️ Patched {list_name}: -{len(remove)} / +{len(append)}")
+                await asyncio.sleep(API_DELAY)
+                return True
+            elif result['status'] == 400:
+                err_data = result.get('data', {})
+                errors = err_data.get('errors', [])
+                # If every error is just "item not found", the desired state is already achieved
+                if errors and all('not found in list' in e.get('message', '') for e in errors):
+                    logger.info(f"  ✅ {list_name}: items already removed (skipped as no-op)")
+                    await asyncio.sleep(API_DELAY)
+                    return True
+                logger.warning(f"  ⚠️ Failed to patch {list_name}: {result['status']} - {err_data}")
+                return False
+            else:
+                err_detail = result.get('data', {})
+                logger.warning(f"  ⚠️ Failed to patch {list_name}: {result['status']} - {err_detail}")
+                return False
+        except Exception as e:
+            logger.error(f"  🚫 Error patching {list_name}: {e}")
+            return False
+
+async def async_update_policy(session: aiohttp.ClientSession, policy_id: str, 
+                             policy_data: Dict) -> bool:
+    """Update an existing policy."""
+    try:
+        url = f"{base_url}/rules/{policy_id}"
+        result = await async_api_request(session, 'PUT', url, policy_data)
+        
+        if result['status'] == 200:
+            logger.info(f"🏆 Updated policy: {policy_data['name']}")
             return True
+        else:
+            logger.error(f"🚫 Failed to update policy {policy_data['name']}: {result}")
+            return False
+    except Exception as e:
+        logger.error(f"🚫 Error updating policy {policy_data['name']}: {e}")
         return False
 
-def update_policy(list_ids, total_domains, cached_rules):
-    name = "Unified Blocklist"
-    expr = " or ".join([f"any(dns.domains[*] in ${lid})" for lid in list_ids])
-    payload = {
-        "name": name, "description": f"Global Unified Blocklist ({total_domains} domains)",
-        "action": "block", "enabled": True, "filters": ["dns"], "precedence": 10000, "traffic": expr
-    }
-    existing = next((r for r in cached_rules if r['name'] == name), None)
-    if existing:
-        logger.info("✍️ Updating policy...")
-        api_request('PUT', f"{base_url}/rules/{existing['id']}", payload)
-    else:
-        logger.info("✍️ Creating policy...")
-        api_request('POST', f"{base_url}/rules", payload)
+def update_policy_for_filter(filter_config: Dict, final_list_ids: List[str], 
+                             target_domain_count: int, cached_rules: List[Dict],
+                             version: Optional[str] = None) -> bool:
+    """Update or create the policy for a filter with version info in description"""
+    filter_name = filter_config["name"]
+    policy_name = filter_name
 
-def run():
-    logger.info("🎬 Starting Global Download & Deduplication...")
-    global_domains = set()
+    if not final_list_ids:
+        logger.warning(f"⚠️ Total list count is 0! Skipping policy update.")
+        return False
+
+    # Build traffic expression
+    expression = " or ".join([f"any(dns.domains[*] in ${lid})" for lid in final_list_ids])
+    priority = filter_config.get('priority', 99)
     
-    for url in blocklists:
+    # Build description with version info
+    description = build_description_with_version(
+        filter_name, 
+        len(final_list_ids), 
+        target_domain_count, 
+        version
+    )
+    
+    policy_payload = {
+        "action": "block",
+        "description": description,
+        "enabled": True,
+        "filters": ["dns"],
+        "name": policy_name,
+        "precedence": priority,
+        "traffic": expression
+    }
+
+    # Check if policy exists to determine POST or PUT
+    existing_policy = next((rule for rule in cached_rules if rule['name'] == policy_name), None)
+    
+    if existing_policy:
+        logger.info(f"✍️ Updating existing policy '{policy_name}'...")
+        async def run_update():
+             # Create a new session for this operation
+            async with aiohttp.ClientSession(headers=headers) as session:
+                return await async_update_policy(session, existing_policy['id'], policy_payload)
+        return asyncio.run(run_update())
+    else:
+        logger.info(f"✍️ Creating new policy '{policy_name}'...")
+        # Fallback to sync request for creation as we didn't make an async helper for simple POST rule
         try:
-            logger.info(f"⬇️ Downloading: {url}")
-            resp = requests.get(url, timeout=REQUEST_TIMEOUT)
-            if resp.status_code == 200:
-                for line in resp.text.splitlines():
-                    line = line.strip()
-                    if line and not line.startswith('#') and is_valid_domain(line):
-                        global_domains.add(line)
+            response = api_request('POST', f"{base_url}/rules", policy_payload)
+            check_api_response(response, f"creating policy {policy_name}")
+            return True
+        except:
+            return False
+
+def process_filter_async(filter_config: Dict, cached_lists: List[Dict], 
+                        cached_rules: List[Dict]) -> Dict:
+    """Process a filter with diff-based updates."""
+    filter_name = filter_config["name"]
+    primary_url = filter_config["url"]
+    backup_url = filter_config.get("backup_url")
+    list_prefix = f"{filter_name.replace(' ', '_')}_List_"
+    policy_name = filter_name
+
+    logger.info(f"{'='*60}")
+    logger.info(f"🧵 Processing filter (DIFF-SYNC): {filter_name}")
+    logger.info(f"{'='*60}")
+
+    # Fetch blocklist source
+    fetched = False
+    content = None
+    for url in [primary_url, backup_url]:
+        if url is None:
+            continue
+        try:
+            response = requests.get(url, timeout=REQUEST_TIMEOUT)
+            if response.status_code == 200:
+                content = response.text
+                fetched = True
+                logger.info(f"🔗 Successfully fetched from {url}")
+                break
         except Exception as e:
-            logger.error(f"⚠️ Failed to download {url}: {e}")
+            logger.warning(f"⚠️ Error fetching from {url}: {e}")
 
-    total_target = len(global_domains)
-    logger.info(f"🎯 Total UNIQUE domains globally: {total_target:,}")
+    if not fetched:
+        return {'success': False, 'filter': filter_name}
 
-    if not global_domains:
-        logger.error("🚫 No domains fetched. Exiting.")
-        return
+    # Parse domains from source and extract version
+    lines = content.splitlines()
+    target_domains = set()
+    current_version = None
+    
+    for line in lines:
+        line = line.strip()
+        
+        # Extract version from header
+        if line.startswith('# Version:') and not current_version:
+            current_version = line.replace('# Version:', '').strip()
+            logger.info(f"🚿 Extracted version from blocklist: {current_version}")
+        
+        # Parse domains
+        if line and not line.startswith('#') and is_valid_domain(line):
+            target_domains.add(line)
 
-    logger.info("📥 Caching Cloudflare state...")
-    cached_rules = get_all_paginated(f"{base_url}/rules")
-    cached_lists = get_all_paginated(f"{base_url}/lists")
-    prefix = "Unified_List_"
-    existing_lists = sorted([l for l in cached_lists if l['name'].startswith(prefix)], key=lambda x: int(x['name'].split('_')[-1]) if x['name'].split('_')[-1].isdigit() else 999)
+    logger.info(f"🎯 Target domains: {len(target_domains):,}")
 
-    # FRESH START LOGIC HERE
+    if not target_domains and not Fresh_Start: # Safety check, unless forced
+        logger.warning(f"🚫 No domains found in source! Aborting to prevent emptying lists.")
+        return {'success': False, 'filter': filter_name}
+
+    # Identify existing lists for this filter
+    existing_lists = [lst for lst in cached_lists if lst['name'].startswith(list_prefix)]
+    # Sort by chunk number
+    try:
+        existing_lists.sort(key=lambda x: int(x['name'].replace(list_prefix, '')) if x['name'].replace(list_prefix, '').isdigit() else 999999)
+    except:
+        pass # Fallback if naming is weird
+        
+    logger.info(f"ℹ️ Found {len(existing_lists)} existing lists for {filter_name}")
+
+    # Process Lists (Diff vs Full Cleanup)
     if Fresh_Start:
-        logger.info("‼ FRESH START ENABLED: Removing old policy and lists...")
-        existing_policy = next((r for r in cached_rules if r['name'] == "Unified Blocklist"), None)
-        
+        logger.info(f"‼ FULL CLEANUP MODE: Deleting everything first for {filter_name}")
+
+        # Delete Policy if exists
+        # We need to delete the policy first so we can delete the lists it uses
+        existing_policy = next((rule for rule in cached_rules if rule['name'] == policy_name), None)
         if existing_policy:
-            logger.info("🗑️ Deleting old policy to release lists...")
-            api_request('DELETE', f"{base_url}/rules/{existing_policy['id']}")
-            cached_rules = [r for r in cached_rules if r['id'] != existing_policy['id']]
-        
+            logger.info(f"Deleting policy '{policy_name}'...")
+            try:
+                # Sync request is fine here for single operation
+                response = api_request('DELETE', f"{base_url}/rules/{existing_policy['id']}")
+                check_api_response(response, f"deleting policy {policy_name}")
+                # Remove from cached_rules so helper knows to create new later
+                cached_rules = [r for r in cached_rules if r['id'] != existing_policy['id']]
+            except Exception as e:
+                logger.error(f"🚫 Failed to delete policy {policy_name}: {e}")
+                # We attempt to continue, but if policy deletion failed, list deletion might fail too (in use)
+
+        # Delete ALL existing lists
         if existing_lists:
-            logger.info("🗑️ Deleting all old unified lists...")
+            logger.info(f"Deleting {len(existing_lists)} old lists...")
             asyncio.run(async_delete_lists_batch(existing_lists))
-            existing_lists = [] # Clears the list to force clean recreation
 
-    remote_map, list_caps = {}, {}
+        # Create New Lists
+        domain_list = list(target_domains)
+        chunks = list(chunker(domain_list, CHUNK_SIZE))
+        
+        async def create_all_new_chunks_cleanup():
+            semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
+            async with aiohttp.ClientSession(headers=headers) as session:
+                tasks = []
+                for i, chunk in enumerate(chunks):
+                    # In destructive mode, we can start from 1 cleanly
+                    chunk_num = i + 1
+                    list_name = f"{list_prefix}{chunk_num}"
+                    tasks.append(async_create_list(session, semaphore, list_name, 
+                                                 filter_name, chunk_num, len(chunks), chunk))
+                return await asyncio.gather(*tasks)
+
+        created_ids = asyncio.run(create_all_new_chunks_cleanup())
+        new_list_ids = [lid for lid in created_ids if lid]
+        
+        # Create Policy
+        policy_success = update_policy_for_filter(filter_config, new_list_ids, len(target_domains), cached_rules, current_version)
+
+        if not policy_success:
+            return {'success': False, 'filter': filter_name}
+
+        return {'success': True, 'filter': filter_name, 'domains': len(target_domains), 'lists': len(new_list_ids)}
+
+    # Fetch current Cloudflare content (ASYNC)
+    remote_domain_to_list_map = {} # domain -> list_id
+    list_capacities = {} # list_id -> current_count
+
+    async def fetch_all_current_content():
+        semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
+        async with aiohttp.ClientSession(headers=headers) as session:
+            tasks = []
+            for lst in existing_lists:
+                tasks.append(async_get_list_items(session, lst['id']))
+            
+            results = await asyncio.gather(*tasks)
+            
+            for i, domains in enumerate(results):
+                lst = existing_lists[i]
+                list_capacities[lst['id']] = len(domains)
+                for d in domains:
+                    remote_domain_to_list_map[d] = lst['id']
+    
     if existing_lists:
-        logger.info("📡 Fetching current list contents...")
-        async def fetch_all():
-            async with aiohttp.ClientSession(headers=headers) as s:
-                tasks = [async_get_list_items(s, l['id']) for l in existing_lists]
-                results = await asyncio.gather(*tasks)
-                for i, doms in enumerate(results):
-                    list_caps[existing_lists[i]['id']] = len(doms)
-                    for d in doms: remote_map[d] = existing_lists[i]['id']
-        asyncio.run(fetch_all())
+        logger.info("📡 Fetching current list contents from Cloudflare...")
+        asyncio.run(fetch_all_current_content())
 
-    current_remote = set(remote_map.keys())
-    to_remove = current_remote - global_domains
-    to_add = list(global_domains - current_remote)
+    # Calculate Diff
+    current_remote_domains = set(remote_domain_to_list_map.keys())
+    
+    # Domains to remove: in Gateway but not in Target
+    to_remove = current_remote_domains - target_domains
+    
+    # Domains to add: in Target but not in Gateway
+    to_add = list(target_domains - current_remote_domains)
+    
+    logger.info(f"⚖️ Diff analysis:")
+    logger.info(f"  ➖ To remove: {len(to_remove)}")
+    logger.info(f"  ➕ To add:    {len(to_add)}")
+    logger.info(f"  🟰 Unchanged: {len(target_domains) - len(to_add)}")
 
-    logger.info(f"⚖️ Diff: ➖ Remove: {len(to_remove)} | ➕ Add: {len(to_add)}")
+    # Apply Patches (ASYNC)
+    
+    # Group removals by list
+    removals_by_list = {} # list_id -> [domains]
+    for domain in to_remove:
+        list_id = remote_domain_to_list_map[domain]
+        if list_id not in removals_by_list:
+            removals_by_list[list_id] = []
+        removals_by_list[list_id].append(domain)
 
-    removals_by_list = {}
-    for d in to_remove:
-        lid = remote_map[d]
-        removals_by_list.setdefault(lid, []).append(d)
+    patches = {} # list_id -> {'remove': [], 'append': []}
 
-    patches = {}
-    for lid, doms in removals_by_list.items():
-        patches[lid] = {'remove': doms, 'append': []}
-        list_caps[lid] -= len(doms)
+    # Plan removals
+    for list_id, domains in removals_by_list.items():
+        if list_id not in patches:
+            patches[list_id] = {'remove': [], 'append': []}
+        patches[list_id]['remove'] = domains
+        # Update capacity locally
+        list_capacities[list_id] -= len(domains)
 
+    # Plan additions (fill holes + use space)
     for lst in existing_lists:
-        lid = lst['id']
-        space = CHUNK_SIZE - list_caps.get(lid, 0)
+        list_id = lst['id']
+        current_cap = list_capacities.get(list_id, 0)
+        space = CHUNK_SIZE - current_cap
+        
         if space > 0 and to_add:
-            chunk = to_add[:space]
+            # Take as much as fits
+            chunk_add = to_add[:space]
             to_add = to_add[space:]
-            patches.setdefault(lid, {'remove': [], 'append': []})['append'] = chunk
-            list_caps[lid] += len(chunk)
+            
+            if list_id not in patches:
+                patches[list_id] = {'remove': [], 'append': []}
+            patches[list_id]['append'] = chunk_add
+            list_capacities[list_id] += len(chunk_add)
+
+    # Execute patches
+    async def execute_patches():
+        semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
+        async with aiohttp.ClientSession(headers=headers) as session:
+            tasks = []
+            for list_id, patch_data in patches.items():
+                list_name = next((l['name'] for l in existing_lists if l['id'] == list_id), list_id)
+                tasks.append(async_patch_list(session, semaphore, list_id, list_name, 
+                                            patch_data['remove'], patch_data['append']))
+            await asyncio.gather(*tasks)
 
     if patches:
         logger.info(f"⚡ Executing {len(patches)} patches...")
-        async def exec_patches():
-            sem = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
-            async with aiohttp.ClientSession(headers=headers) as s:
-                tasks = [async_patch_list(s, sem, lid, lid, p['remove'], p['append']) for lid, p in patches.items()]
-                await asyncio.gather(*tasks)
-        asyncio.run(exec_patches())
+        asyncio.run(execute_patches())
+    else:
+        logger.info("No patches needed for existing lists.")
 
+    # Create New Lists for remaining additions
     new_list_ids = []
     if to_add:
-        logger.info(f"🏗️ Creating new lists for {len(to_add)} domains...")
+        logger.info(f"Creating new lists for {len(to_add)} remaining domains...")
         chunks = list(chunker(to_add, CHUNK_SIZE))
-        start_idx = max([int(l['name'].split('_')[-1]) for l in existing_lists] + [0])
         
-        async def create_new():
-            sem = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
-            async with aiohttp.ClientSession(headers=headers) as s:
+        # Determine next chunk number
+        current_max_chunk = 0
+        for lst in existing_lists:
+            try:
+                num = int(lst['name'].replace(list_prefix, ''))
+                current_max_chunk = max(current_max_chunk, num)
+            except:
+                pass
+        
+        # Determine start index for new chunks to continue numbering from existing lists
+        # Example: If List_5 exists, new chunks start at List_6
+        # We manually loop here to ensure correct numbering avoids conflicts
+        
+        async def create_new_chunks():
+            semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
+            async with aiohttp.ClientSession(headers=headers) as session:
                 tasks = []
                 for i, chunk in enumerate(chunks):
-                    idx = start_idx + 1 + i
-                    tasks.append(async_create_list(s, sem, f"{prefix}{idx}", f"Unified chunk {idx}", chunk))
+                    chunk_num = current_max_chunk + 1 + i
+                    list_name = f"{list_prefix}{chunk_num}"
+                    tasks.append(async_create_list(session, semaphore, list_name, 
+                                                 filter_name, chunk_num, len(chunks)+current_max_chunk, chunk))
                 return await asyncio.gather(*tasks)
-        new_list_ids = [lid for lid in asyncio.run(create_new()) if lid]
 
-    final_ids = [l['id'] for l in existing_lists if list_caps.get(l['id'], 0) > 0] + new_list_ids
-    empty_lists = [l for l in existing_lists if list_caps.get(l['id'], 0) == 0]
+        created_ids = asyncio.run(create_new_chunks())
+        new_list_ids = [lid for lid in created_ids if lid]
 
-    update_policy(final_ids, total_target, cached_rules)
+    # Identify empty lists and prepare final list IDs
+    # If patches caused a list to become empty (and no appends filled it), we should delete it
+    # Check capacities
+    lists_to_delete = []
+    final_list_ids = []
+    
+    for lst in existing_lists:
+        if list_capacities.get(lst['id'], 0) == 0:
+            lists_to_delete.append(lst)
+        else:
+            final_list_ids.append(lst['id'])
+    
+    final_list_ids.extend(new_list_ids)
 
-    if empty_lists:
-        logger.info(f"🧹 Deleting {len(empty_lists)} empty lists...")
-        asyncio.run(async_delete_lists_batch(empty_lists))
+    # Update/Create Policy FIRST (this removes references to empty lists)
+    policy_success = update_policy_for_filter(filter_config, final_list_ids, len(target_domains), cached_rules, current_version)
+    
+    # Now delete empty lists after policy no longer references them
+    if lists_to_delete:
+        logger.info(f"Deleting {len(lists_to_delete)} empty lists...")
+        asyncio.run(async_delete_lists_batch(lists_to_delete))
 
-    logger.info("✅ Update complete!")
+    if not policy_success:
+        return {'success': False, 'filter': filter_name}
 
+    return {'success': True, 'filter': filter_name, 'domains': len(target_domains), 'lists': len(final_list_ids)}
+
+
+
+# Execution
 if __name__ == "__main__":
-    run()
+    logger.info("🎬 Starting Cloudflare Gateway Adblock Update...\n")
+    logger.info(f"🆕 Fresh start: {'YES' if Fresh_Start else 'NO'}")
+    logger.info(f"🧬 Check versions: {'ENABLED' if CHECK_VERSIONS else 'DISABLED'}")
+    logger.info(f"🏎️ Max concurrent requests: {MAX_CONCURRENT_REQUESTS}\n")
+
+    # Cache current rules for version checking from policy descriptions
+    logger.info("📡 Fetching current policies to check versions...")
+    try:
+        cached_rules_early = get_all_paginated(f"{base_url}/rules")
+        logger.info(f"📋 Fetched {len(cached_rules_early)} rules")
+    except Exception as e:
+        logger.warning(f"⚠️ Could not fetch rules: {e}. Continuing without version checking...")
+        cached_rules_early = []
+
+    # Load versions from policy descriptions
+    cached_versions = load_versions_from_policies(cached_rules_early)
+    if cached_versions:
+        logger.info(f"💾 Loaded {len(cached_versions)} versions from policy descriptions\n")
+    else:
+        logger.info("❓ No version info found in policy descriptions (first run or migration)\n")
+
+    # Check which filters need updating
+    filters_to_update = []
+
+    logger.info("🔍 Checking blocklist versions...\n")
+    for bl in blocklists:
+        filter_name = bl['name']
+        should_update, current_version, reason = should_update_filter(bl, cached_rules_early)
+        
+        if should_update:
+            logger.info(f"✅ {filter_name}: WILL UPDATE ({reason})")
+            filters_to_update.append(bl)
+        else:
+            logger.info(f"⏭️ {filter_name}: SKIP ({reason})")
+
+    logger.info(f"\n{'='*60}")
+    logger.info(f"🆙 Filters to update: {len(filters_to_update)}/{len(blocklists)}")
+    logger.info(f"{'='*60}\n")
+
+    if not filters_to_update:
+        logger.info("🎉 All filters are up to date! No updates needed.")
+        logger.info("\n✅ Script completed successfully!")
+        sys.exit(0)
+
+    # Cache current state
+    logger.info("📥 Caching current rules and lists...")
+    try:
+        cached_rules = get_all_paginated(f"{base_url}/rules")
+        cached_lists = get_all_paginated(f"{base_url}/lists")
+        logger.info(f"📋 Cached {len(cached_rules)} rules and {len(cached_lists)} lists\n")
+    except Exception as e:
+        logger.error(f"🚫 Failed to cache rules/lists: {e}", exc_info=True)
+        sys.exit(1)
+
+    # Process filters with async
+    stats = {
+        "filters_processed": 0,
+        "total_domains": 0,
+        "lists_created": 0,
+        "policies_created": 0,
+        "errors": []
+    }
+
+    script_start = time.time()
+
+    for bl in filters_to_update:
+        try:
+            filter_start = time.time()
+            result = process_filter_async(bl, cached_lists, cached_rules)
+            filter_elapsed = time.time() - filter_start
+            
+            if result['success']:
+                stats["filters_processed"] += 1
+                stats["total_domains"] += result.get('domains', 0)
+                stats["lists_created"] += result.get('lists', 0)
+                stats["policies_created"] += 1
+                
+                logger.info(f"🏁 Filter completed in {filter_elapsed:.1f}s")
+                
+                # Refresh cache
+                cached_rules = get_all_paginated(f"{base_url}/rules")
+                cached_lists = get_all_paginated(f"{base_url}/lists")
+            else:
+                stats["errors"].append(bl['name'])
+                
+        except Exception as e:
+            logger.error(f"🚫 Failed to process {bl['name']}: {e}", exc_info=True)
+            stats["errors"].append(bl['name'])
+
+    script_elapsed = time.time() - script_start
+
+
+    # Summary
+    logger.info(f"\n{'='*60}")
+    logger.info("SUMMARY")
+    logger.info(f"{'='*60}")
+    logger.info(f"🧪 Filters checked: {len(blocklists)}")
+    logger.info(f"⬆️ Filters updated: {stats['filters_processed']}/{len(filters_to_update)}")
+    logger.info(f"⏭️ Filters skipped: {len(blocklists) - len(filters_to_update)}")
+    logger.info(f"🌐 Total domains: {stats['total_domains']:,}")
+    logger.info(f"🧩 Lists created: {stats['lists_created']}")
+    logger.info(f"🏛️ Policies created: {stats['policies_created']}")
+    logger.info(f"🗃️ Total lists in account: {len(cached_lists)}")
+    logger.info(f"\n⏱️  Total script execution time: {script_elapsed:.1f}s")
+
+    if stats['errors']:
+        logger.warning(f"\n⚠️ Failed filters ({len(stats['errors'])}): {', '.join(stats['errors'])}")
+        sys.exit(1)
+    else:
+        logger.info("\n✅✅ All filters updated successfully!")
